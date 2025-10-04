@@ -344,6 +344,22 @@
             gap: 12px;
         }
 
+        .import-feedback {
+            min-height: 20px;
+            margin-top: 12px;
+            font-size: 0.85rem;
+            color: var(--muted-text);
+            text-align: center;
+        }
+
+        .import-feedback.success {
+            color: var(--success-color);
+        }
+
+        .import-feedback.error {
+            color: var(--danger-color);
+        }
+
         .budget-row {
             background: rgba(79, 172, 254, 0.1);
             border-radius: 12px;
@@ -1157,6 +1173,11 @@
                 <button class="btn btn-secondary" style="justify-content: center;" onclick="downloadData()">
                     📁 Exporter les données
                 </button>
+                <button class="btn btn-secondary" style="justify-content: center; margin-top: 10px;" type="button" onclick="triggerImportDialog()">
+                    📥 Importer des données
+                </button>
+                <input type="file" id="importFile" accept="application/json" style="display: none;" onchange="handleImport(event)">
+                <div id="importStatus" class="import-feedback" role="status" aria-live="polite"></div>
             </div>
             <div class="chart-container">
                 <h3 class="chart-title">Aperçus rapides</h3>
@@ -2116,6 +2137,157 @@
             URL.revokeObjectURL(url);
         }
 
+        function triggerImportDialog() {
+            const input = document.getElementById('importFile');
+            if (input) {
+                input.click();
+            }
+        }
+
+        function setImportStatus(message, tone = 'info') {
+            const status = document.getElementById('importStatus');
+            if (!status) return;
+
+            status.textContent = message;
+            status.className = message ? `import-feedback ${tone}`.trim() : 'import-feedback';
+
+            if (message) {
+                clearTimeout(setImportStatus.timeoutId);
+                setImportStatus.timeoutId = window.setTimeout(() => {
+                    status.textContent = '';
+                    status.className = 'import-feedback';
+                }, 3200);
+            }
+        }
+
+        function parseNumber(value, fallback = 0) {
+            const numericValue = typeof value === 'number' ? value : parseFloat(value);
+            return Number.isFinite(numericValue) ? numericValue : fallback;
+        }
+
+        function normalizeTransactions(list) {
+            if (!Array.isArray(list)) return [];
+
+            const baseId = Date.now();
+            return list
+                .filter((item) => item && typeof item === 'object' && (item.type === 'expense' || item.type === 'income'))
+                .map((item, index) => {
+                    const normalized = { ...item };
+                    normalized.id = typeof item.id === 'number' ? item.id : baseId + index;
+                    normalized.amount = parseNumber(item.amount);
+                    normalized.date = item.date || new Date().toISOString().split('T')[0];
+
+                    if (normalized.type === 'expense') {
+                        normalized.category = item.category || 'other';
+                        normalized.source = item.source === 'bank' || item.source === 'both' ? item.source : 'pocket';
+
+                        const pocketPart = parseNumber(item.fromPocket, normalized.source === 'pocket' ? normalized.amount : 0);
+                        const bankPart = parseNumber(item.fromBank, normalized.source === 'bank' ? normalized.amount : 0);
+
+                        if (normalized.source === 'both') {
+                            normalized.fromPocket = pocketPart;
+                            normalized.fromBank = bankPart;
+                        } else if (normalized.source === 'bank') {
+                            normalized.fromPocket = 0;
+                            normalized.fromBank = bankPart || normalized.amount;
+                        } else {
+                            normalized.fromPocket = pocketPart || normalized.amount;
+                            normalized.fromBank = 0;
+                        }
+                    } else {
+                        normalized.location = item.location === 'bank' ? 'bank' : 'pocket';
+                        normalized.fromPocket = parseNumber(item.fromPocket, 0);
+                        normalized.fromBank = parseNumber(item.fromBank, 0);
+                    }
+
+                    return normalized;
+                });
+        }
+
+        function handleImport(event) {
+            const input = event.target;
+            const file = input.files && input.files[0];
+            if (!file) return;
+
+            if (file.type && file.type !== 'application/json') {
+                setImportStatus('Merci de sélectionner un fichier JSON (.json).', 'error');
+                input.value = '';
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = () => {
+                try {
+                    const parsed = JSON.parse(reader.result);
+                    if (!parsed || typeof parsed !== 'object') {
+                        throw new Error('Fichier vide ou invalide');
+                    }
+
+                    const hasKnownData = Array.isArray(parsed.transactions)
+                        || Object.prototype.hasOwnProperty.call(parsed, 'bankMoney')
+                        || Object.prototype.hasOwnProperty.call(parsed, 'pocketMoney')
+                        || (parsed.budgets && typeof parsed.budgets === 'object');
+
+                    if (!hasKnownData) {
+                        throw new Error('Aucune donnée compatible trouvée');
+                    }
+
+                    const hasTransactions = Array.isArray(parsed.transactions);
+                    const hasBudgets = parsed.budgets && typeof parsed.budgets === 'object';
+                    const hasBalances = Object.prototype.hasOwnProperty.call(parsed, 'bankMoney')
+                        || Object.prototype.hasOwnProperty.call(parsed, 'pocketMoney');
+
+                    const importedTransactions = hasTransactions ? normalizeTransactions(parsed.transactions) : transactions;
+                    const importedBankMoney = Object.prototype.hasOwnProperty.call(parsed, 'bankMoney')
+                        ? parseNumber(parsed.bankMoney, bankMoney)
+                        : bankMoney;
+                    const importedPocketMoney = Object.prototype.hasOwnProperty.call(parsed, 'pocketMoney')
+                        ? parseNumber(parsed.pocketMoney, pocketMoney)
+                        : pocketMoney;
+                    const importedBudgets = hasBudgets
+                        ? { ...createDefaultBudgets(), ...parsed.budgets }
+                        : budgets;
+
+                    transactions = importedTransactions;
+                    bankMoney = importedBankMoney;
+                    pocketMoney = importedPocketMoney;
+                    budgets = importedBudgets;
+
+                    saveData();
+                    persistBudgets();
+                    renderBudgetEditor();
+                    updateDisplay();
+
+                    const summaryDetails = [];
+                    if (hasTransactions) {
+                        summaryDetails.push(`${importedTransactions.length} transaction${importedTransactions.length > 1 ? 's' : ''}`);
+                    }
+                    if (hasBalances) {
+                        summaryDetails.push('soldes');
+                    }
+                    if (hasBudgets) {
+                        summaryDetails.push('budgets');
+                    }
+
+                    const suffix = summaryDetails.length ? ` (${summaryDetails.join(', ')})` : '';
+                    setImportStatus(`Données importées avec succès${suffix}.`, 'success');
+                } catch (error) {
+                    console.error('Import JSON échoué :', error);
+                    setImportStatus('Impossible d\'importer ce fichier. Vérifiez son contenu.', 'error');
+                } finally {
+                    input.value = '';
+                }
+            };
+
+            reader.onerror = () => {
+                console.error('Lecture du fichier échouée :', reader.error);
+                setImportStatus('Erreur lors de la lecture du fichier.', 'error');
+                input.value = '';
+            };
+
+            reader.readAsText(file);
+        }
+
         document.getElementById('filterType').addEventListener('change', (event) => {
             filters.type = event.target.value;
             renderTransactions();
@@ -2168,4 +2340,3 @@
     </script>
 </body>
 </html>
-
